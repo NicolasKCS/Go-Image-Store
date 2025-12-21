@@ -1,16 +1,19 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"sync"
+	"os"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
-// The same struct as before
 type ImageMetadata struct {
-	ID       string `json:"id"`
+	ID       int    `json:"id"`
 	Filename string `json:"filename"`
 	Size     int64  `json:"size"`
 }
@@ -26,28 +29,24 @@ func (rec *StatusRecorder) WriteHeader(code int) {
 }
 
 type App struct {
-	db   []ImageMetadata
-	lock sync.RWMutex // Read-Write Mutex: Allows many readers, but only one writer.
+	db *sql.DB
 }
 
-// --- THE CHALLENGE IS HERE ---
 // 1. Middleware is just a function that takes a Handler and returns a Handler
 func LoggerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// TODO: Record the time right now (Start Timer)
+
 		start := time.Now()
-		// TODO: Call the 'next' handler (Pass the request down the chain)
-		// Hint: next.ServeHTTP(w, r)
+
 		recorder := &StatusRecorder{ResponseWriter: w, StatusCode: http.StatusOK}
 		next.ServeHTTP(recorder, r)
-		// TODO: Calculate how much time passed since the start
+
 		elapsed := time.Since(start)
 		color := "\033[32m" // Green
 		if recorder.StatusCode >= 400 && recorder.StatusCode < 500 {
 			color = "\033[31m" // Red
 		}
-		// TODO: Print the Method (GET/POST), Path, and Duration
-		// Example: fmt.Printf("[%s] %s %v\n", r.Method, r.URL.Path, duration)
+
 		fmt.Printf("%s %d Method [%s] path %s  duration %v\n", color, recorder.StatusCode, r.Method, r.URL.Path, elapsed)
 
 	})
@@ -55,9 +54,42 @@ func LoggerMiddleware(next http.Handler) http.Handler {
 
 func main() {
 
-	app := &App{
-		db: []ImageMetadata{},
+	// 1. Get Config from Docker Environment
+	connStr := fmt.Sprintf("host=%s user=%s password=%s dbname=%s sslmode=disable",
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_NAME"),
+	)
+	// 2. Connect to Database
+	var db *sql.DB
+	var err error
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", connStr)
+		if err == nil {
+			err = db.Ping()
+		}
+		if err == nil {
+			break // Successfully connected
+		}
+		fmt.Println("Waiting for DB to be ready...", err)
+		time.Sleep(2 * time.Second)
 	}
+
+	if err != nil {
+		log.Fatal("Could not connect to the database:", err)
+	}
+	// 3. Create the Table (Migration)
+	_, err = db.Exec(`Create table if not exists images (
+		id serial PRIMARY KEY,
+		filename text not null, 
+		size BIGINT
+	)`)
+	if err != nil {
+		log.Fatal("Could not create table:", err)
+	}
+	app := &App{db: db}
+
 	// 1. The Router (ServeMux)
 	// In Go std lib, we use a "Mux" (Multiplexer) to match URLs to functions.
 	mux := http.NewServeMux()
@@ -106,15 +138,29 @@ func (app *App) imagesHandler(w http.ResponseWriter, r *http.Request) {
 // Logic for GET
 func (app *App) listImages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	app.lock.RLock()
-	defer app.lock.RUnlock()
+
+	rows, err := app.db.Query("select id, filename, size from images order by id")
+	if err != nil {
+		http.Error(w, "Failed to query database", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var images []ImageMetadata
+	for rows.Next() {
+		var img ImageMetadata
+		if err := rows.Scan(&img.ID, &img.Filename, &img.Size); err != nil {
+			http.Error(w, "Failed to scan row", http.StatusInternalServerError)
+			return
+		}
+		images = append(images, img)
+	}
+
 	// Manually encode the Go slice into JSON
 	encoder := json.NewEncoder(w)
-	if err := encoder.Encode(app.db); err != nil {
+	if err := encoder.Encode(images); err != nil {
 		http.Error(w, "Failed to encode JSON", http.StatusInternalServerError)
 	}
-	fmt.Println(app.db)
-
 }
 
 // Logic for POST
@@ -129,14 +175,17 @@ func (app *App) createImage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Important: Always close the body to prevent memory leaks!
 	defer r.Body.Close()
-	app.lock.Lock()
-	defer app.lock.Unlock()
-	// "Save" to memory
-	// images = append(images, newImage)
-	app.db = append(app.db, newImage)
+
+	err := app.db.QueryRow(`insert into images (filename, size) values ($1, $2) returning id`,
+		newImage.Filename, newImage.Size).
+		Scan(&newImage.ID)
+	if err != nil {
+		http.Error(w, "Failed to insert into database", http.StatusInternalServerError)
+		return
+	}
 
 	// Send response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "created"})
+	json.NewEncoder(w).Encode(newImage)
 }

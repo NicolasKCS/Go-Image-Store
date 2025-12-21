@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # 1. Your Go Application
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # This is how we connect. "db" is the hostname of the service below!
+      - DB_HOST=db 
+      - DB_USER=user
+      - DB_PASSWORD=password
+      - DB_NAME=imagedb
+    depends_on:
+      - db
+
+  # 2. The Database
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: imagedb
+    ports:
+      - "5432:5432" # Expose port if you want to check DB with a tool like DBeaver
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

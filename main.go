@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	_ "github.com/lib/pq"
 )
 
@@ -29,7 +34,9 @@ func (rec *StatusRecorder) WriteHeader(code int) {
 }
 
 type App struct {
-	db *sql.DB
+	db       *sql.DB
+	s3Client *s3.Client
+	bucket   string
 }
 
 // 1. Middleware is just a function that takes a Handler and returns a Handler
@@ -88,7 +95,43 @@ func main() {
 	if err != nil {
 		log.Fatal("Could not create table:", err)
 	}
-	app := &App{db: db}
+
+	// 1. Load the Default Config (Just Credentials & Region)
+	// We do NOT set the endpoint here anymore.
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion("us-east-1"), // MinIO needs a region, even if fake
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			os.Getenv("S3_ACCESS_KEY"),
+			os.Getenv("S3_SECRET_KEY"),
+			"", // Session Token (empty)
+		)),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 2. Create the S3 Client with MinIO Specific Options
+	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// --- THE MODERN WAY ---
+		// Use BaseEndpoint instead of a custom resolver
+		s3Endpoint := "http://" + os.Getenv("S3_ENDPOINT")
+		o.BaseEndpoint = aws.String(s3Endpoint)
+
+		// Required for MinIO (Forces http://host/bucket/file instead of http://bucket.host/file)
+		o.UsePathStyle = true
+	})
+
+	// 3. Create Bucket (Quick check)
+	bucketName := os.Getenv("S3_BUCKET")
+	_, _ = s3Client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
+		Bucket: aws.String(bucketName),
+	})
+
+	app := &App{
+		db:       db,
+		s3Client: s3Client,
+		bucket:   bucketName,
+	}
 
 	// 1. The Router (ServeMux)
 	// In Go std lib, we use a "Mux" (Multiplexer) to match URLs to functions.
@@ -165,27 +208,49 @@ func (app *App) listImages(w http.ResponseWriter, r *http.Request) {
 
 // Logic for POST
 func (app *App) createImage(w http.ResponseWriter, r *http.Request) {
-	var newImage ImageMetadata
+	// 1. Parse Multipart Form (Max 10MB)
+	r.ParseMultipartForm(10 << 20)
 
-	// Manually decode the incoming JSON body into our struct
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&newImage); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-	// Important: Always close the body to prevent memory leaks!
-	defer r.Body.Close()
-
-	err := app.db.QueryRow(`insert into images (filename, size) values ($1, $2) returning id`,
-		newImage.Filename, newImage.Size).
-		Scan(&newImage.ID)
+	// 2. Retrieve file
+	file, handler, err := r.FormFile("image")
 	if err != nil {
-		http.Error(w, "Failed to insert into database", http.StatusInternalServerError)
+		http.Error(w, "Error retrieving file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	fmt.Printf("Uploading File: %+v\n", handler.Filename)
+
+	// 3. Upload to S3 (MinIO) - V2 Syntax
+	_, err = app.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket:      aws.String(app.bucket),
+		Key:         aws.String(handler.Filename),
+		Body:        file,
+		ContentType: aws.String(handler.Header.Get("Content-Type")),
+	})
+
+	if err != nil {
+		http.Error(w, "Failed to upload to S3", http.StatusInternalServerError)
+		fmt.Println("S3 Upload Error:", err)
 		return
 	}
 
-	// Send response
+	// 4. Save Metadata to DB (Same as before)
+	var id int
+	err = app.db.QueryRow(`INSERT INTO images (filename, size) VALUES ($1, $2) RETURNING id`,
+		handler.Filename, handler.Size).Scan(&id)
+
+	if err != nil {
+		http.Error(w, "Database insert failed", http.StatusInternalServerError)
+		return
+	}
+
+	// 5. Respond
+	response := ImageMetadata{
+		ID:       id,
+		Filename: handler.Filename,
+		Size:     handler.Size,
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(newImage)
+	json.NewEncoder(w).Encode(response)
 }

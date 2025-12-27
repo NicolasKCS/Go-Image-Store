@@ -20,8 +20,13 @@ FROM alpine:latest
 
 WORKDIR /root/
 
+#add curl package for debugging
+RUN apk add --no-cache curl ca-certificates
+
 # Copy only the compiled binary from the builder stage
 COPY --from=builder /app/main .
+
+
 
 # Open the port
 EXPOSE 8080

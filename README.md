@@ -7,3 +7,6 @@ Important commands
 3. echo "test1" > test1.png
 4. curl -X POST http://localhost:8080/images -F "image=@test1.png"
 5. curl -X DELETE http://localhost:8080/images/1
+6. http://localhost:8080/download/1 # download
+6.1 curl http://localhost:8080/download/1 -o myimage.png #download
+6.3 curl -v http://localhost:8080/download/1 -o out.bin

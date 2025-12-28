@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -150,6 +151,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/images/", app.imagesHandler)
 	mux.HandleFunc("/images", app.imagesHandler)
+	mux.HandleFunc("/download/", app.downloadImage)
 
 	fmt.Println("Server starting on :8080...")
 
@@ -309,4 +311,39 @@ func (app *App) deleteImage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 
+}
+
+func (app *App) downloadImage(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/download/")
+	if id == "" {
+		http.Error(w, "Image ID is required", http.StatusBadRequest)
+		return
+	}
+	imageID, err := strconv.Atoi(id)
+	if err != nil {
+		http.Error(w, "Invalid Image ID", http.StatusBadRequest)
+		return
+	}
+	var objectKey string
+	err = app.db.QueryRow("SELECT object_key FROM images WHERE id=$1", imageID).Scan(&objectKey)
+	if err != nil {
+		http.Error(w, "Image not found", http.StatusNotFound)
+		return
+	}
+	resp, err := app.s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(app.bucket),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		http.Error(w, "Failed to download from S3", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	ct := "application/octet-stream"
+	if resp.ContentType != nil && *resp.ContentType != "" {
+		ct = *resp.ContentType
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", objectKey))
+	io.Copy(w, resp.Body)
 }
